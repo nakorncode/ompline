@@ -16,7 +16,17 @@ Pre-release, version 0.1.0. The project is not complete, and interfaces may chan
 
 ## Installation
 
-No installer is published yet. Build instructions will be added when the scaffold lands.
+No installer is published yet. To run or build from source, see [Development](#development).
+
+## Development
+
+```bash
+bun install
+bun run tauri dev    # run the desktop app with hot reload
+bun run test         # unit tests (Vitest)
+bun run typecheck    # TypeScript check
+bun run build        # frontend production build
+```
 
 ## Design
 
