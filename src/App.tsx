@@ -1,117 +1,208 @@
-import { createSignal, For, Show } from "solid-js";
-import { Channel, invoke } from "@tauri-apps/api/core";
-import { frameType, type RpcEvent } from "./rpc";
+import { createMemo, createSignal, Show } from "solid-js";
+import { SessionView } from "./components/SessionView";
+import { Sidebar, type WorkspaceGroup } from "./components/Sidebar";
+import * as commands from "./omp/commands";
+import type { SessionRecord } from "./omp/record";
+import { applyFrame, initialSessionState, type SessionState } from "./omp/session-state";
+import { sendCommand, startProcess, stopProcess } from "./omp/session";
+import { parseFrame } from "./omp/wire";
+import type { RpcEvent } from "./rpc";
+import "./App.css";
 
-const MAX_LOG_LINES = 500;
-const PREVIEW_CHARS = 300;
+let commandCounter = 0;
+const nextId = () => `ui-${++commandCounter}`;
+let sessionCounter = 0;
+const nextSessionKey = () => `session-${++sessionCounter}`;
+
+function groupByWorkspace(records: SessionRecord[]): WorkspaceGroup[] {
+  const groups = new Map<string, SessionRecord[]>();
+  for (const record of records) {
+    groups.set(record.workspace, [...(groups.get(record.workspace) ?? []), record]);
+  }
+  return [...groups].map(([workspace, items]) => ({ workspace, records: items }));
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void; reject: (reason: Error) => void } {
+  let resolve!: () => void;
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 function App() {
   const [ompPath, setOmpPath] = createSignal("omp");
-  const [workspace, setWorkspace] = createSignal("");
-  const [sessionId, setSessionId] = createSignal<number | null>(null);
-  const [command, setCommand] = createSignal('{"id":"req_1","type":"get_state"}');
-  const [log, setLog] = createSignal<string[]>([]);
-  const [error, setError] = createSignal<string | null>(null);
+  const [newWorkspace, setNewWorkspace] = createSignal("");
+  const [startError, setStartError] = createSignal<string | null>(null);
+  const [records, setRecords] = createSignal<SessionRecord[]>([]);
+  const [activeKey, setActiveKey] = createSignal<string | null>(null);
 
-  function append(entry: string) {
-    setLog((lines) => [...lines.slice(-(MAX_LOG_LINES - 1)), entry]);
+  const groups = createMemo(() => groupByWorkspace(records()));
+  const active = createMemo(() => records().find((record) => record.key === activeKey()));
+
+  function patch(key: string, change: (record: SessionRecord) => SessionRecord) {
+    setRecords((list) => list.map((record) => (record.key === key ? change(record) : record)));
   }
 
-  function handleEvent(event: RpcEvent) {
-    if (event.kind === "frame") {
-      append(`${frameType(event.line)}: ${event.line.slice(0, PREVIEW_CHARS)}`);
-    } else {
-      append(`omp exited (code ${event.code ?? "by signal"})`);
-      setSessionId(null);
+  function patchState(key: string, change: (state: SessionState) => SessionState) {
+    patch(key, (record) => ({ ...record, state: change(record.state) }));
+  }
+
+  function bridgeIdOf(key: string): number | undefined {
+    return records().find((record) => record.key === key)?.bridgeId;
+  }
+
+  /** Runs a command against a session's process and reports failures in the session's state. */
+  async function send(key: string, command: commands.Command) {
+    const bridgeId = bridgeIdOf(key);
+    if (bridgeId === undefined) return;
+    try {
+      await sendCommand(bridgeId, command);
+    } catch (error) {
+      patchState(key, (state) => ({ ...state, error: String(error) }));
     }
   }
 
-  async function start() {
-    setError(null);
-    const events = new Channel<RpcEvent>();
-    events.onmessage = handleEvent;
+  async function openSession() {
+    const workspace = newWorkspace().trim();
+    if (!workspace) {
+      setStartError("Enter a workspace folder first.");
+      return;
+    }
+    setStartError(null);
+
+    const key = nextSessionKey();
+    const readiness = deferred();
+    // The rejection is handled below; this only stops a early exit from being reported as unhandled.
+    readiness.promise.catch(() => undefined);
+
+    const onEvent = (event: RpcEvent) => {
+      if (event.kind === "exited") {
+        const suffix = event.code === null ? "" : ` with code ${event.code}`;
+        patch(key, (record) => ({
+          ...record,
+          status: "stopped",
+          bridgeId: undefined,
+          state: {
+            ...record.state,
+            isStreaming: false,
+            notices: [...record.state.notices, { level: "warning", message: `omp exited${suffix}` }],
+          },
+        }));
+        readiness.reject(new Error("omp exited before it was ready"));
+        return;
+      }
+
+      const frame = parseFrame(event.line);
+      if (!frame) {
+        patchState(key, (state) => ({
+          ...state,
+          notices: [...state.notices, { level: "error", message: "omp wrote a line that is not JSON" }],
+        }));
+        return;
+      }
+      if (frame.type === "ready") readiness.resolve();
+      patchState(key, (state) => applyFrame(state, frame));
+    };
+
+    setRecords((list) => [...list, { key, workspace, status: "starting", state: initialSessionState() }]);
+    setActiveKey(key);
+
+    let bridgeId: number;
     try {
-      const id = await invoke<number>("start_session", {
-        ompPath: ompPath(),
-        cwd: workspace(),
-        events,
-      });
-      setSessionId(id);
-    } catch (e) {
-      setError(String(e));
+      bridgeId = await startProcess(ompPath().trim() || "omp", workspace, onEvent);
+    } catch (error) {
+      setRecords((list) => list.filter((record) => record.key !== key));
+      setActiveKey(null);
+      setStartError(String(error));
+      return;
+    }
+
+    patch(key, (record) => ({ ...record, bridgeId }));
+    try {
+      await readiness.promise;
+      patch(key, (record) => ({ ...record, status: "running" }));
+      // Each session gets a fresh conversation in its workspace, so start one explicitly.
+      await sendCommand(bridgeId, commands.newSession(nextId()));
+      await sendCommand(bridgeId, commands.getState(nextId()));
+    } catch (error) {
+      patchState(key, (state) => ({ ...state, error: String(error) }));
     }
   }
 
-  async function send() {
-    const id = sessionId();
-    if (id === null) return;
-    setError(null);
+  function sendMessage(key: string, text: string) {
+    // While omp is working, a new message queues as a follow-up. Otherwise it starts a turn.
+    const streaming = records().find((record) => record.key === key)?.state.isStreaming ?? false;
+    const command = streaming ? commands.followUp(nextId(), text) : commands.prompt(nextId(), text);
+    void send(key, command);
+  }
+
+  function steerMessage(key: string, text: string) {
+    void send(key, commands.steer(nextId(), text));
+  }
+
+  function abortRun(key: string) {
+    void send(key, commands.abort(nextId()));
+  }
+
+  async function respond(key: string, requestId: string, value: string) {
+    const bridgeId = bridgeIdOf(key);
+    if (bridgeId === undefined) return;
     try {
-      await invoke("send_frame", { sessionId: id, line: command() });
-    } catch (e) {
-      setError(String(e));
+      await sendCommand(bridgeId, commands.approvalResponse(requestId, value));
+      patchState(key, (state) => ({ ...state, approval: undefined }));
+    } catch (error) {
+      patchState(key, (state) => ({ ...state, error: String(error) }));
     }
   }
 
-  async function stop() {
-    const id = sessionId();
-    if (id === null) return;
-    setError(null);
+  async function stopSession(key: string) {
+    const bridgeId = bridgeIdOf(key);
+    if (bridgeId === undefined) return;
     try {
-      await invoke("stop_session", { sessionId: id });
-      setSessionId(null);
-    } catch (e) {
-      setError(String(e));
+      await stopProcess(bridgeId);
+      patch(key, (record) => ({ ...record, status: "stopped", bridgeId: undefined }));
+    } catch (error) {
+      patchState(key, (state) => ({ ...state, error: String(error) }));
     }
   }
 
   return (
-    <main>
-      <h1>ompline</h1>
-      <p>Protocol probe: start omp in RPC mode and send raw frames. This is not the final UI.</p>
+    <div class="app">
+      <Sidebar
+        groups={groups()}
+        activeKey={activeKey()}
+        ompPath={ompPath()}
+        onOmpPathInput={setOmpPath}
+        newWorkspace={newWorkspace()}
+        onNewWorkspaceInput={setNewWorkspace}
+        startError={startError()}
+        onOpen={() => void openSession()}
+        onSelect={setActiveKey}
+      />
 
-      <label>
-        omp binary{" "}
-        <input value={ompPath()} onInput={(e) => setOmpPath(e.currentTarget.value)} />
-      </label>
-      <label>
-        workspace folder{" "}
-        <input value={workspace()} onInput={(e) => setWorkspace(e.currentTarget.value)} />
-      </label>
-
-      <div>
-        <button type="button" onClick={start} disabled={sessionId() !== null}>
-          Start session
-        </button>{" "}
-        <button type="button" onClick={stop} disabled={sessionId() === null}>
-          Stop session
-        </button>
-      </div>
-
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          void send();
-        }}
+      <Show
+        when={active()}
+        fallback={
+          <main class="session">
+            <p class="muted">Enter a workspace folder in the sidebar and start a session.</p>
+          </main>
+        }
       >
-        <textarea
-          rows={3}
-          value={command()}
-          onInput={(e) => setCommand(e.currentTarget.value)}
-        />
-        <div>
-          <button type="submit" disabled={sessionId() === null}>
-            Send frame
-          </button>
-        </div>
-      </form>
-
-      <Show when={error()}>{(message) => <p role="alert">{message()}</p>}</Show>
-
-      <pre>
-        <For each={log()}>{(entry) => <div>{entry}</div>}</For>
-      </pre>
-    </main>
+        {(record) => (
+          <SessionView
+            record={record()}
+            onSend={(text) => sendMessage(record().key, text)}
+            onSteer={(text) => steerMessage(record().key, text)}
+            onAbort={() => abortRun(record().key)}
+            onRespond={(requestId, value) => void respond(record().key, requestId, value)}
+            onStopSession={() => void stopSession(record().key)}
+          />
+        )}
+      </Show>
+    </div>
   );
 }
 
